@@ -3,7 +3,7 @@ name: idea memo template
 about: five ws headers for idea memo.
 title: ''
 labels: ''
-assignees: Marco3jp
+assignees: ''
 
 ---
 
