@@ -1,152 +1,128 @@
 # 03. MVP 設計
 
-「**まずミニマムに作ってみてから考える**」という依頼方針に従い、
-本書は **MVP として実装すべき最小構成** だけを書く。
-将来拡張のための抽象化は `data-model` と `PlayerAdapter` インターフェイスの 2 点だけに留め、
-他は素直で短いコードで書ける構造にする。
+「**まずミニマムに作ってみてから考える**」「**自動キュー化より先に手動キューを作る**」という
+依頼方針に従い、本書は MVP として実装すべき最小構成だけを書く。
 
-## 1. 全体像
+## 1. コンセプト
+
+- **「次これ見よう」をプラットフォーム横断で 1 本のキューに積み、頭から消化する**ツール。
+- 入口は **URL 1 本貼って Enter**。チャンネル登録・自動クロール・おすすめは MVP では作らない。
+- 再生方式は対象に応じて 3 通り（後述）。すべて 1 つの統一 UI から操作する。
+
+## 2. 全体像
 
 ```
 ┌──────────── Linux PC（自宅 LAN 内、常駐） ────────────┐
-│                                                     │
-│  ┌──────────────┐    ┌────────────────────────┐     │
-│  │ nagara API    │   │ better-sqlite3 (file)  │     │
-│  │ (Hono / Node) │←─→│ ./data/nagara.db       │     │
-│  └──────┬───────┘    └────────────────────────┘     │
-│         │ Static    fetch (RSS, JSON)               │
-│         │ files     ↓                               │
-│  ┌──────▼───────┐                                  │
-│  │ nagara Web   │ ── ▲ public RSS endpoints の取得  │
-│  │ (静的 SPA)   │     │                            │
-│  └──────────────┘     ▼                            │
-│                                                     │
-└────────────────────────┬────────────────────────────┘
-                         │ HTTP (LAN)
-                  ┌──────▼───────┐
-                  │ Windows PC   │ ブラウザで http://nagara.local:5173
-                  │ (Chrome 等)  │
-                  └──────────────┘
-                         │
-                         ▼
-              ┌──────────────────────────┐
-              │ 各サービス（YouTube 等） │ ← ブラウザから直接 iframe / audio
-              └──────────────────────────┘
+│                                                       │
+│  ┌──────────────┐    ┌────────────────────────┐       │
+│  │ nagara API   │←──→│ better-sqlite3 (file) │       │
+│  │ (Hono/Node)  │    │ ./data/nagara.db       │       │
+│  └──────┬───────┘    └────────────────────────┘       │
+│         │ Static                                       │
+│         │ files     fetch (oEmbed, og:tags, RSS)       │
+│  ┌──────▼───────┐                                      │
+│  │ nagara Web   │ ──▲                                  │
+│  │ (静的 SPA)   │   │                                  │
+│  └──────────────┘   ▼                                  │
+└─────────────────────┬──────────────────────────────────┘
+                      │ HTTP (LAN)
+               ┌──────▼───────┐
+               │ Windows PC   │ ブラウザで http://nagara.local:<port>
+               │ (Chrome 等)  │
+               └──┬───────────┘
+                  │
+                  ▼
+       ┌──────────────────────────────────────────┐
+       │ 各サービス（YouTube は iframe 直接再生／  │
+       │ TVer 等は新規タブ）                       │
+       └──────────────────────────────────────────┘
 ```
 
 ポイント:
+- メディアのストリーム自体はサーバを経由しない。ブラウザから配信元へ直接。
+- バックエンドの外部通信は **メタ取得（oEmbed / og:タグ / Podcast RSS）のみ**。
 
-- **動画／音声ストリーム自体はサーバーを経由しない。** ブラウザから YouTube／Podcast 配信元へ直接。
-  これによりサーバー側は単なる「メタデータ／キュー管理サービス」で済む。
-- バックエンドが触る外部通信は、各チャンネルの **新着取得（XML/RSS）のみ**。
-
-## 2. デプロイ戦略
+## 3. デプロイ戦略
 
 要件「起動が面倒なのは避けたい」を最優先する。
 
 ### 採用: Linux PC で systemd 常駐
 
 - `node dist/server.js` を `nagara.service` として登録。
-- ブラウザは `http://<linux-ip>:<port>` を開きっぱなしにしておけば、再起動なしで使える。
-- フロントとバックエンドは **同一プロセス／同一ポート** で配信する（Hono が静的ファイルもサーブ）。
-  → `FRONTEND_ORIGIN`／CORS の設定が要らなくなり、ミニマム化に寄与。
+- フロントとバックエンドは **同一プロセス／同一ポート** で配信（Hono が静的ファイルもサーブ）。
+  → CORS 設定不要、起動コマンドが 1 個になる。
+- ブラウザは `http://<linux-ip>:<port>` を開きっぱなしにしておけば再起動なしで使える。
 
-### 不採用: Windows PC で常駐
+### 不採用: Windows PC で常駐／Docker Compose
 
-- 起動毎にコンソールが立つ／タスクトレイ常駐の作り込みが要る。
-- 「起動が面倒」を悪化させる。
-- それでも単体で動かしたい場合は、同じ Node スクリプトを Windows でも `node dist/server.js` で
-  立てれば動く。クロスプラットフォーム差は出ない。
+理由は前回の設計と同じ（タスクトレイ常駐の作り込み・Docker Engine 前提が「起動が面倒」要件に逆行）。
 
-### 不採用: Docker Compose
-
-- ミニマムには重い。SQLite ファイルだけ持てばいいツールに Docker Engine の前提を要求するのは
-  「起動が面倒を避けたい」要件に逆行する。
-- 代わりに **配布物は単一 Node プロジェクト**（フロント／バックエンドを 1 つの `package.json` に）。
-
-## 3. 採用技術スタック
+## 4. 採用技術スタック
 
 「ミニマム」と「ローカル単体起動」を最優先。
 
 | レイヤ | 採用 | 不採用と理由 |
 |---|---|---|
 | バックエンドランタイム | Node.js 22 LTS + TypeScript | — |
-| バックエンドフレームワーク | **Hono**（Node アダプタ） | Express でも可だが、静的配信＋ルーティング＋型推論が Hono の方が短く書ける |
-| DB | **`better-sqlite3`**（同期ドライバ） | Drizzle / Prisma は MVP には過剰。スキーマも単純、テーブル数が一桁。素の SQL のほうが小さい |
-| マイグレーション | 起動時に `CREATE TABLE IF NOT EXISTS` を流すだけ | drizzle-kit / prisma migrate は MVP では不要 |
-| RSS パース | `fast-xml-parser` | `rss-parser` よりわずかに軽量、依存も少ない。動作はどちらでも可 |
-| スケジューラ | `setInterval`（プロセス内） | node-cron / BullMQ は MVP には大袈裟。1 プロセスに閉じる |
-| フロントビルド | **Vite + React + TypeScript** | Next.js は SSR を使わないため過剰。Vite で静的ファイル吐いて Hono が配信 |
-| 状態管理 | `useState` / `useReducer` のみ | Zustand / Redux は MVP では不要。画面が 3〜4 枚しかない |
-| HTTP クライアント | 素の `fetch` | SWR / React Query は MVP では不要。再取得も画面更新時で足りる |
-| スタイル | CSS Modules（ベタ書き） | Tailwind / shadcn は導入コストの方が大きい |
+| バックエンドフレームワーク | **Hono**（Node アダプタ） | 静的配信＋ルーティング＋型推論が短く書ける |
+| DB | **`better-sqlite3`**（同期ドライバ） | ORM は MVP では過剰 |
+| マイグレーション | 起動時に `CREATE TABLE IF NOT EXISTS` を流すだけ | drizzle-kit/prisma migrate は不要 |
+| RSS / HTML パース | `fast-xml-parser` ＋ 正規表現での meta タグ抽出 | jsdom は重い |
+| フロントビルド | **Vite + React + TypeScript** | Next.js は SSR 不要なので過剰 |
+| 状態管理 | `useState` / `useReducer` のみ | Zustand/Redux は不要 |
+| HTTP クライアント | 素の `fetch` | SWR/React Query は不要 |
+| スタイル | CSS Modules（ベタ書き） | Tailwind/shadcn は導入コスト > 効用 |
 
-> ここでの方針は **「足りなくなったら入れる」** であって、「最初から将来を見越して全部入れる」ではない。
-> Issue 本文の依頼に揃えてある。
+## 5. データモデル
 
-## 4. データモデル
-
-SQLite。テーブル 5 個。すべて `id INTEGER PRIMARY KEY AUTOINCREMENT`。
-拡張のためのフィールドは確保しつつ、UI を作るのは MVP スコープ内のもののみ。
+SQLite。テーブル 4 個（前回の 5 個から `channels` を削除して `queue_items` を追加）。
 
 ```sql
--- チャンネル（YouTube チャンネル / Podcast 番組）
-CREATE TABLE IF NOT EXISTS channels (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  source_type     TEXT NOT NULL CHECK (source_type IN ('youtube', 'podcast')),
-  source_url      TEXT NOT NULL UNIQUE,         -- 元 URL（人間が貼ったもの）
-  feed_url        TEXT NOT NULL,                -- 実際にクロールする RSS URL
-  external_id     TEXT,                         -- YouTube: UC...
-  title           TEXT NOT NULL,
-  order_policy    TEXT NOT NULL DEFAULT 'newest_first'
-                  CHECK (order_policy IN ('newest_first', 'oldest_first')),
-  is_enabled      INTEGER NOT NULL DEFAULT 1,
-  last_crawled_at TEXT,
-  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- エピソード（動画 / ポッドキャストの 1 本）
-CREATE TABLE IF NOT EXISTS episodes (
-  id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  channel_id       INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-  external_id      TEXT NOT NULL,               -- YouTube: videoId / Podcast: <guid>
-  title            TEXT NOT NULL,
-  description      TEXT,
-  source_type      TEXT NOT NULL,               -- 'youtube' | 'podcast'
-  media_url        TEXT,                        -- Podcast: <enclosure url>。YouTube は NULL（videoId で再生）
+-- アイテム（キューに入れた／入っていた 1 件）
+-- 同じ URL を再追加することは可能（手動キューの尊重）。
+CREATE TABLE IF NOT EXISTS items (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_url    TEXT NOT NULL,                    -- ユーザが貼った原 URL
+  source_kind   TEXT NOT NULL CHECK (source_kind IN
+                  ('youtube_video', 'audio_file', 'external_link')),
+  external_id   TEXT,                              -- youtube_video: videoId / audio_file: NULL / external_link: NULL
+  media_url     TEXT,                              -- audio_file: 直リン URL / 他: NULL
+  title         TEXT,                              -- メタ取得後に埋まる
+  author        TEXT,                              -- 投稿者名／チャンネル名／サイト名
+  thumbnail_url TEXT,
   duration_seconds INTEGER,
-  published_at     TEXT,                        -- ISO8601
-  is_disabled      INTEGER NOT NULL DEFAULT 0,  -- 手動 Disabled
-  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE (channel_id, external_id)
+  meta_status   TEXT NOT NULL DEFAULT 'pending'    -- 'pending' | 'ok' | 'failed'
+                  CHECK (meta_status IN ('pending', 'ok', 'failed')),
+  meta_error    TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_episodes_channel    ON episodes(channel_id);
-CREATE INDEX IF NOT EXISTS idx_episodes_published  ON episodes(published_at);
 
--- 視聴履歴（同じエピソードを複数回再生し得るので複数行可）
-CREATE TABLE IF NOT EXISTS watch_history (
+-- キュー（順序付き、いま再生中もこのテーブルで表現）
+CREATE TABLE IF NOT EXISTS queue_items (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  position    INTEGER NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'queued'
+                CHECK (status IN ('queued', 'playing')),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_queue_position ON queue_items(position);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_queue_one_playing
+  ON queue_items(status) WHERE status = 'playing';
+
+-- 履歴（キューから消えた／流し終わった行を貯める）
+CREATE TABLE IF NOT EXISTS history (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  episode_id       INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-  status           TEXT NOT NULL CHECK (status IN ('started', 'completed', 'skipped')),
-  progress_seconds INTEGER,                     -- skipped 時の最終再生位置
+  item_id          INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  status           TEXT NOT NULL CHECK (status IN ('completed', 'skipped', 'removed')),
+  progress_seconds INTEGER,
   played_at        TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at      TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_history_episode ON watch_history(episode_id);
+CREATE INDEX IF NOT EXISTS idx_history_item ON history(item_id);
 
--- フィルタ（正規表現／ミュート／キーワードを 1 テーブルにまとめる）
-CREATE TABLE IF NOT EXISTS filters (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  filter_type TEXT NOT NULL CHECK (filter_type IN ('regex', 'channel_mute', 'keyword')),
-  channel_id  INTEGER REFERENCES channels(id) ON DELETE CASCADE,  -- channel_mute / regex の対象
-  pattern     TEXT,                              -- regex / keyword の文字列
-  note        TEXT,
-  is_enabled  INTEGER NOT NULL DEFAULT 1,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- KV 形式の設定（ザッピング間隔等）
+-- KV 設定（ザッピング間隔等）
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -156,175 +132,150 @@ CREATE TABLE IF NOT EXISTS settings (
 
 設計上のメモ:
 
-- **キューを永続化テーブルにしない。** Issue で「キュー」と呼んでいる対象は
-  「いま再生可能なエピソード一覧」を都度計算したものに過ぎない。
-  履歴と Disabled とフィルタを引いた SELECT 一発で出せるので、テーブルを増やす必要がない。
-  → 実装行数が減り、整合性バグも減る。
-- `filters` テーブルでミュート・正規表現・キーワードを 1 つにまとめてあるのは、
-  UI を別画面にするのが MVP では過剰だから。型のバリデーションは TS 側で。
-- 「投稿者単位ミュート」と「チャンネル単位ミュート」が等価になっているが、
-  本ツールの意味では「投稿者 = チャンネル」なので分ける必要が無い。
+- `items` と `queue_items` を分離した理由は **「履歴に残った行を再キューしたい」** から。
+  キューから消えた瞬間に `items` ごと削除すると、履歴・再追加で URL のメタを再取得する羽目になる。
+- `queue_items.status = 'playing'` を最大 1 件に制限する部分インデックス（SQLite 3.8.0+）で
+  「いま再生中はキュー全体で 1 件まで」を DB レベルで保証する。
+  → アプリ側のロックを書かずに済む。
+- 同じ `item_id` をキューに複数回入れることは許容（同じ URL を 2 回流したい用途のため）。
+- `position` の連番管理は「常にゼロ詰めで再採番」ではなく **疎な整数で運用** し、
+  「2 と 3 の間に挿入したいときは 2.5 → 整数化を後でやる」みたいなことはしない。
+  挿入のたびに `UPDATE queue_items SET position = position + 1 WHERE position >= ?` でずらす
+  シンプルな方式で十分（数十〜数百件しか並ばない想定なので速度問題は起きない）。
 
-## 5. バックエンド API（最小セット）
+## 6. バックエンド API
 
-すべて `application/json`。エラーは HTTP ステータス＋ `{ "error": "..." }` を返す。
-認証は無し（LAN 限定）。
+すべて `application/json`。エラーは HTTP ステータス + `{ "error": "..." }`。
+認証なし（LAN 限定）。
 
-### 5-1. チャンネル
-
-| Method | Path | 振る舞い |
-|---|---|---|
-| GET | `/api/channels` | 一覧（`is_enabled`, `last_crawled_at` 含む） |
-| POST | `/api/channels` | `{ url }` を受け取り、YouTube / Podcast を自動判定して登録 |
-| PATCH | `/api/channels/:id` | `is_enabled` / `order_policy` の更新 |
-| DELETE | `/api/channels/:id` | 削除（episodes は ON DELETE CASCADE） |
-| POST | `/api/channels/:id/refresh` | 即時クロール（手動） |
-
-URL 自動判定ルール（[02-research.md](./02-research.md) を踏まえる）:
-
-```
-入力 url
-  ├ youtube.com/channel/UC... または youtube.com/feeds/videos.xml?channel_id=UC...
-  │     → channel_id を抽出して feed_url を組み立てる
-  ├ youtube.com/@handle 形式
-  │     → 当該 URL を取得して "channelId":"UC..." を正規表現で抽出
-  └ それ以外
-        → そのまま RSS と仮定して fast-xml-parser で読む
-        → <itunes:author> 等の存在で podcast 判定
-```
-
-### 5-2. キュー（= 「次に流せるエピソード」一覧）
+### 6-1. アイテム（メタ取得）
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| GET | `/api/queue?limit=20` | 次に流せる順に最大 N 件を返す |
-| POST | `/api/queue/start` | 1 件を「再生開始」として履歴に `started` を記録し、再生情報を返す |
-| POST | `/api/queue/complete` | 「再生完了 / スキップ」を履歴に記録（body に `episodeId` と `status`、必要なら `progressSeconds`） |
+| POST | `/api/items` | `{ url }` を受け取って `items` に保存し、メタ取得をキック |
+| GET  | `/api/items/:id` | アイテム 1 件取得（メタ取得状態の確認用） |
+| POST | `/api/items/:id/refetch` | メタ取得を再試行 |
 
-キュー生成 SQL（イメージ）:
+`POST /api/items` の処理フロー:
 
-```sql
-SELECT e.*, c.title AS channel_title, c.source_type, c.order_policy
-FROM episodes e
-JOIN channels c ON c.id = e.channel_id
-WHERE c.is_enabled = 1
-  AND e.is_disabled = 0
-  AND NOT EXISTS (
-    SELECT 1 FROM watch_history h
-    WHERE h.episode_id = e.id AND h.status = 'completed'
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM filters f
-    WHERE f.is_enabled = 1
-      AND (
-           (f.filter_type = 'channel_mute' AND f.channel_id = c.id)
-        OR (f.filter_type = 'regex'        AND e.title REGEXP f.pattern)
-        OR (f.filter_type = 'keyword'      AND e.title LIKE '%' || f.pattern || '%')
-      )
-  )
-ORDER BY ...;
+```
+1. URL を正規化（fragment 除去等）
+2. URL から source_kind を判定
+   ├ youtube.com / youtu.be / shorts / live → 'youtube_video' (videoId 抽出)
+   ├ Content-Type が audio/* または拡張子 .mp3 .m4a .ogg .aac → 'audio_file' (HEAD で判定)
+   └ それ以外                                              → 'external_link'
+3. items に INSERT (meta_status='pending')
+4. メタ取得を非同期で実行（プロセス内のキュー、せいぜい 4 並列）
+   ├ youtube_video → oEmbed (https://www.youtube.com/oembed?url=...)
+   ├ audio_file    → HEAD で Content-Length, ファイル名から title 推定
+   └ external_link → HTML を GET して og:* を正規表現で抽出
+5. items を UPDATE (meta_status='ok' or 'failed', title/author/thumbnail/duration をセット)
 ```
 
-並び替えはアプリ側 JS で
+メタ取得は失敗してもキュー再生は破綻しない（再生は URL 直で出来るので、見出しが空のまま再生される）。
 
-1. チャンネルごとにグループ化
-2. `order_policy` に従って並び替え
-3. チャンネル間でラウンドロビン
-4. `limit` で切る
-
-の手順を踏む。SQL に押し込まないのは、可読性とテスト容易性のため。
-
-実装上の注意:
-
-- SQLite には標準で `REGEXP` 演算子が入っていない（演算子だけ予約され、実装は別途必要）。
-  `better-sqlite3` を使う前提では、起動時に `db.function('regexp', { deterministic: true }, (pattern, value) => new RegExp(pattern).test(value ?? '') ? 1 : 0)` を登録して有効化する。
-- フィルタを SQL の `EXISTS` に押し込むのが嫌なら、`regex` フィルタだけアプリ側で適用する分岐に
-  しても良い（その場合は `channel_mute` / `keyword` だけ SQL で先に絞り、結果を JS で正規表現フィルタに掛ける）。MVP ではどちらでも可。
-
-### 5-3. エピソード操作
+### 6-2. キュー操作（コア）
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| GET | `/api/channels/:id/episodes` | チャンネル別エピソード一覧（最近 100 件） |
-| PATCH | `/api/episodes/:id` | `{ is_disabled }` の更新 |
+| GET    | `/api/queue` | 現在のキューを `position` 昇順で返す（`status` 含む） |
+| POST   | `/api/queue` | `{ url }` でキュー末尾に追加（内部で `POST /api/items` と同等の処理＋キュー追加） |
+| POST   | `/api/queue/insert-next` | `{ url }`：いま再生中の **次** に挿入 |
+| PATCH  | `/api/queue/:id` | `{ position }` の差し替え（並び替え） |
+| DELETE | `/api/queue/:id` | キューから削除（履歴 status='removed' を 1 行追加） |
+| POST   | `/api/queue/play` | `{ queueItemId }` を `status='playing'` に。直前の `playing` は完了として履歴へ |
+| POST   | `/api/queue/complete` | `{ progressSeconds, status }` を受けて、いま `playing` の行を履歴に移して削除 |
 
-### 5-4. 履歴
+`POST /api/queue/play` の動作:
+- 直前の `playing` 行があれば、それを **`history`（status='skipped'）に移して削除**。
+- 指定 `queueItemId` を `status='playing'` に更新。
+- レスポンスとして「いま再生中のアイテムの全情報」と「次の queue_item」を返す。
+
+`POST /api/queue/complete` の動作:
+- `body.status` は `'completed' | 'skipped'`。
+- `playing` の行を見つけて `history` に INSERT、`queue_items` から削除。
+- 次のキュー先頭を返す（あれば）。
+
+### 6-3. 履歴
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| GET | `/api/history?limit=50` | 直近の履歴 |
+| GET  | `/api/history?limit=100` | 最新の履歴 |
+| POST | `/api/history/:id/requeue` | 履歴の行をキュー末尾に再投入（同じ `item_id` で `queue_items` を作る） |
 
-### 5-5. 設定 / フィルタ
+### 6-4. 設定
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| GET / PATCH | `/api/settings` | KV を一括取得・部分更新 |
-| GET / POST / DELETE | `/api/filters` | 一覧／追加／削除 |
+| GET    | `/api/settings` | KV 全件 |
+| PATCH  | `/api/settings` | KV 部分更新 |
 
-### 5-6. クロール
+主要キー:
+| key | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `zapping_timeout_seconds` | number | `0`（無効） | エピソード再生開始から自動スキップまでの秒数 |
+| `zapping_grace_seconds` | number | `10` | 「続き見る？」表示時間 |
+| `default_playback_rate` | number | `1.0` | 再生速度デフォルト |
+| `outbound_user_agent` | string | 空 | サーバが外部メタ取得時に使う UA（環境変数 `OUTBOUND_USER_AGENT` でも可） |
 
-| トリガ | 内容 |
-|---|---|
-| プロセス起動時 | `is_enabled = 1` の全チャンネルを順に 1 回クロール |
-| 60 分ごと（`setInterval`） | 同上 |
-| `POST /api/channels/:id/refresh` | 当該 1 件のみクロール |
+## 7. フロントエンド設計
 
-クロール処理:
-
-1. `feed_url` に対し `fetch`（必要に応じて `User-Agent: ${OUTBOUND_USER_AGENT ?? "nagara/0.1"}`）。
-2. fast-xml-parser で `<entry>`（YouTube）または `<item>`（Podcast）を取り出す。
-3. `(channel_id, external_id)` で UPSERT。
-4. 失敗時はログに残してスキップ（1 チャンネルの失敗で全体を止めない）。
-
-## 6. フロントエンド設計
-
-画面は最小 4 つ。すべて 1 ページの SPA としても、別ルートでもよい。
+画面は最小 3 つ（前回より 1 つ減らした）。
 
 ```
-/                ← プレイヤー（メイン画面）
-/channels        ← チャンネル登録・一覧
-/channels/:id    ← エピソード一覧・Disabled トグル
-/history         ← 視聴履歴（読み取りのみ）
+/                ← プレイヤー（メイン画面、キューも横に並ぶ）
+/history         ← 履歴（読み取り＋再投入）
+/settings        ← 設定（ザッピング・UA 等）
 ```
 
-設定（ザッピング間隔・フィルタ）は当面プレイヤー画面右上のドロワーに同居。
-画面を増やすほど MVP の重量が増えるため、明示的に 1 ヶ所に集約する。
+「チャンネル一覧」画面は MVP では存在しない（チャンネル管理機能が無いため）。
 
-### 6-1. メインプレイヤー画面の構成
+### 7-1. メインプレイヤー画面
 
 ```
-┌─────────────────────────────────────────────┐
-│ nagara                       [Channels][Hist] │
-├─────────────────────────────────────────────┤
-│                                              │
-│   ┌──────────────────────────────────────┐  │
-│   │ Player 領域                          │  │
-│   │   - source_type が youtube  → YT iframe│  │
-│   │   - source_type が podcast  → <audio>  │  │
-│   └──────────────────────────────────────┘  │
-│                                              │
-│   タイトル / チャンネル名 / 公開日           │
-│                                              │
-│   [▶/⏸] [⏭次へ] [速度 ×1.0 ▾] [全画面]       │
-│                                              │
-├─────────────────────────────────────────────┤
-│ Up next（キュー先頭 5 件）                   │
-└─────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ nagara                              [履歴] [設定]            │
+├────────────────────────────┬───────────────────────────────┤
+│                             │ ▼ 次の再生（キュー）            │
+│   ┌─────────────────────┐   │ ┌─────────────────────────┐  │
+│   │ Player 領域          │   │ │ ☰ 1. タイトル A    ✕  │  │
+│   │  - youtube_video →  │   │ │   チャンネル / 12:34    │  │
+│   │    YT iframe        │   │ ├─────────────────────────┤  │
+│   │  - audio_file →     │   │ │ ☰ 2. タイトル B    ✕  │  │
+│   │    <audio>          │   │ │   投稿者 / 1:08:22      │  │
+│   │  - external_link →  │   │ ├─────────────────────────┤  │
+│   │    "外部で開く" UI  │   │ │ ☰ 3. ...               │  │
+│   └─────────────────────┘   │ └─────────────────────────┘  │
+│                             │                               │
+│   タイトル / 投稿者 / 公開日 │   ─ URL を貼ってキュー追加 ─  │
+│                             │   ┌─────────────────────┐    │
+│   [▶/⏸] [⏭次へ] [×1.0 ▾]   │   │ https://...        │    │
+│   [全画面] [外部で開く]     │   └────────────[追加]┘     │
+└────────────────────────────┴───────────────────────────────┘
 ```
 
-### 6-2. PlayerAdapter インターフェイス
+主要な UI 要素:
+- 右ペイン上部に **キュー**（ドラッグで並び替え／× で削除）。
+- 右ペイン下部に **URL 入力欄**。Enter または「追加」で末尾追加。
+  - 入力値が複数行なら 1 行ずつまとめて追加（コピペで複数 URL 投入する用途）。
+- いま再生中のアイテムは右ペインの **キュー 0 行目** として強調表示する
+  （`queue_items.status='playing'` の行）。
+- 「次これ再生」アクションはコンテキストメニュー（右クリック）or 各行のメニューから。
 
-「ドメインごとにロード／再生／一時停止／見終わり／速度／フルスクリーンを統一」する要件に対する
-唯一の抽象化レイヤー。実装は MVP では 2 つだけ。
+### 7-2. PlayerAdapter インターフェイス
+
+「ドメインごとにロード／再生／一時停止／見終わり／速度／フルスクリーンを統一」する要件への
+唯一の抽象化レイヤー。MVP では実装 3 つ。
 
 ```ts
 type PlayerEvent =
   | { type: "ended" }
-  | { type: "error"; code: string; message: string };
+  | { type: "error"; code: string; message: string }
+  | { type: "needs_user_action"; reason: "external_link" | "autoplay_blocked" };
 
 interface PlayerAdapter {
   mount(container: HTMLElement): Promise<void>;
-  load(episode: Episode): Promise<void>;
+  load(item: Item): Promise<void>;
   play(): Promise<void>;
   pause(): Promise<void>;
   setRate(rate: number): Promise<void>;
@@ -337,21 +288,20 @@ interface PlayerAdapter {
 
 | 実装 | 中身 |
 |---|---|
-| `YouTubeAdapter` | `<div>` に対し YouTube IFrame Player API で `YT.Player` を生成。`onStateChange` で `ENDED` を `ended` に変換。`onError` を `error` に変換。フルスクリーンは外側コンテナに `requestFullscreen()` |
-| `PodcastAudioAdapter` | `<audio>` を `container` 配下に作成。`ended` イベントをそのまま `ended` に変換。`error` イベントを `error` に。`playbackRate` で速度。フルスクリーンは概念的に意味が薄いので、コンテナ拡大表示で代用 |
+| `YouTubeAdapter` | `<div>` に YouTube IFrame Player API で `YT.Player` を生成。`onStateChange` の `ENDED` を `ended` に。`onError` 101/150 の場合は **`needs_user_action`（reason='external_link'）** を発火し、上位レイヤが「外部で開く」モードへ落とす |
+| `AudioAdapter` | `<audio>` を生成。`ended`／`error` を変換。`playbackRate` で速度。フルスクリーンは無効 |
+| `ExternalLinkAdapter` | プレイヤー領域に「外部で視聴中」UI を出す。`load()` 時に `window.open(url, '_blank')` を発火（ユーザ操作ハンドラ内で）。`getCurrentTime`/`getDuration` は `0`／`NaN` で返す。`ended` はユーザが「見終わった」を押した時に発火 |
 
-### 6-3. 自動再生の制御
+### 7-3. 自動再生の制御
 
-- 初回起動時は **「Start listening」ボタン** を中央に表示し、ユーザーが押した瞬間に
-  最初の `play()` を発火する（[02-research.md](./02-research.md) §1-2 / §5）。
-- 連鎖再生（ended → 次のエピソードへ）は同一ジェスチャ文脈内で動くので追加対応不要。
-- 連鎖中に Autoplay ブロックされたら、画面中央に「Resume」ボタンを再表示する（フォールバック）。
+- 初回起動時はプレイヤー領域に **「再生を開始」ボタン**。クリックで `play()`。
+- 連鎖再生は同一ジェスチャ文脈内で動くので追加対応不要。
+- `play()` が `NotAllowedError` で reject されたら「Resume」ボタンを再表示する。
 
-### 6-4. ザッピング機能
+### 7-4. ザッピング機能
 
-- 設定 `zapping_interval_seconds`（デフォルト 1800 = 30 分）。0 なら無効。
-- 各エピソード再生開始時に `setTimeout` を仕込む。
-- タイマー満了時、画面下部にオーバーレイ:
+- 設定 `zapping_timeout_seconds`（デフォルト `0` = 無効）。
+- 0 でない場合、エピソード再生開始から該当秒数経過時にオーバーレイ:
 
   ```
   ┌────────────────────────────┐
@@ -361,71 +311,80 @@ interface PlayerAdapter {
   └────────────────────────────┘
   ```
 
-- 猶予秒数 `zapping_grace_seconds`（デフォルト 10）が経つか「いま切替」を押すと、
-  現在エピソードを `skipped`（progress_seconds 付き）として履歴に記録し、次へ。
-- 「このまま続ける」を押すとタイマーをリセットして再開。
-- `ended` イベント由来の遷移時はこのオーバーレイは出さない。
-  Issue の意図（「数分で次に行く」「続き見ることもできる」）に合致。
+- 猶予秒数 `zapping_grace_seconds`（デフォルト 10）が経つか「いま切替」で
+  `POST /api/queue/complete { status: 'skipped', progressSeconds }` を発行して次へ。
+- 「このまま続ける」でタイマーリセット。
+- `ended` 由来の遷移時はオーバーレイなしで即次へ（自然に終わったケース）。
 
-### 6-5. UA 指定
+**MVP のデフォルトを 0（無効）にする理由:**
+- タスクフィードバック「自分で積んだものを強制スキップしたくない」を尊重。
+- ユーザが運用してみて「やっぱりタイマー欲しい」となったら設定で有効化する。
 
-- 画面の `Settings` ドロワーで `Outbound User-Agent` を 1 つ入力できる。
-- 値は `settings` テーブルの `outbound_user_agent` キーに保存。
-- バックエンドのクロール処理が起動時／更新時に読み出して fetch のヘッダに使う。
-- 「ブラウザ自体の UA を変える」は技術的に不可能なため、サーバー側のクロール時のみ反映される旨を
-  注釈に明記する（要望者＝作者本人なので注釈で十分）。
+### 7-5. URL 投入 → 再生までのフロント側フロー
 
-## 7. ディレクトリ構成（実装着手時の想定）
+```
+URLを貼る → POST /api/queue { url }
+            └→ items + queue_items 作成、メタ取得は非同期
+キュー再取得 → 末尾に新しい行が追加される（title が空でも先に position は確定）
+ポーリング or SWR で
+items.meta_status='ok' を検知 → 該当行のタイトル等を更新表示
+```
+
+メタ取得が失敗しても `source_url` は分かるので、行は表示し続ける（タイトル欄が空 or "（メタ取得失敗）"）。
+
+## 8. ディレクトリ構成（実装着手時の想定）
 
 ```
 nagara/                # ← 設計ドキュメント（このフォルダ）
 nagara-app/            # ← 実装が始まったらここに置く想定
 ├ package.json
 ├ src/
-│  ├ server/           # Hono ルート、SQLite 接続、クロールジョブ
+│  ├ server/
 │  │  ├ index.ts
 │  │  ├ db.ts
 │  │  ├ schema.sql
-│  │  ├ crawler.ts
+│  │  ├ meta/                  # メタ取得（oEmbed / og:tags / RSS）
+│  │  │  ├ youtube-oembed.ts
+│  │  │  ├ og-tags.ts
+│  │  │  └ audio-head.ts
 │  │  └ routes/
-│  │     ├ channels.ts
+│  │     ├ items.ts
 │  │     ├ queue.ts
-│  │     ├ episodes.ts
 │  │     ├ history.ts
-│  │     ├ settings.ts
-│  │     └ filters.ts
-│  └ web/              # Vite ビルド対象
+│  │     └ settings.ts
+│  └ web/
 │     ├ index.html
 │     ├ main.tsx
 │     ├ player/
 │     │  ├ PlayerAdapter.ts
 │     │  ├ YouTubeAdapter.ts
-│     │  └ PodcastAudioAdapter.ts
+│     │  ├ AudioAdapter.ts
+│     │  └ ExternalLinkAdapter.ts
 │     ├ pages/
 │     │  ├ Player.tsx
-│     │  ├ Channels.tsx
-│     │  └ History.tsx
+│     │  ├ History.tsx
+│     │  └ Settings.tsx
 │     └ components/...
 ├ data/                # SQLite ファイル（gitignore）
 └ scripts/
    └ install-systemd.sh
 ```
 
-実装フェーズに入った時の参考程度。本タスクの成果物は `nagara/` 以下のドキュメントのみ。
+## 9. 受け入れ条件（DoD）
 
-## 8. 実装着手順（受け入れ条件チェックリスト）
+依頼方針「ミニマムに作って触ってから設計を詰める」を満たすため、初回リリースの DoD:
 
-依頼の「ミニマムに作って触ってから設計を詰める」を満たすために、
-**初回リリースの DoD** を以下とする:
-
-- [ ] チャンネル URL を貼ると登録できる（YouTube・Podcast の両方）。
-- [ ] 自動クロールが回り、`episodes` に新着が入る。
-- [ ] プレイヤー画面で「Start」を押すと、キューの先頭から再生が始まる。
-- [ ] エピソード末尾まで来たら自動で次に進む（`ended` 検知）。
-- [ ] ザッピング設定時間が経つと「続けるか／切るか」のオーバーレイが出る。
-- [ ] エピソードは履歴 `completed` で同じものが再キューされない。
-- [ ] エピソード一覧から個別に Disable できる。
+- [ ] YouTube 動画 URL を貼ると、メタが自動で埋まってキュー末尾に入る。
+- [ ] mp3 直リンを貼ると、メタが推定で埋まってキュー末尾に入り、`<audio>` で再生される。
+- [ ] TVer のような任意の URL を貼ると、og:タグからメタが入り、キューに混ざる。
+      再生は「外部で開く」となり、ユーザが「見終わった」を押せば次へ進む。
+- [ ] キューはドラッグで並び替えできる。削除も「次これ再生」も動く。
+- [ ] エピソード末尾まで来たら自動で次に進む（YouTube の `ended` / `<audio>` の `ended`）。
+- [ ] ブラウザ再起動してもキューが復元される（SQLite 永続化）。
+- [ ] 履歴画面で過去のアイテムを再投入できる。
+- [ ] ザッピングタイマーは設定で有効化したときのみ動作する。
 - [ ] Linux PC で `node dist/server.js` を systemd に登録するだけで常駐できる。
 
-これが満たせれば、初回の "触ってみる" は十分にできる。
-そこから実運用してみての違和感を [04-roadmap.md](./04-roadmap.md) のロードマップに沿って潰していく。
+ここまで満たせば「触ってみる」が成立する。
+そこから運用してみて、自動キューイングや投稿者管理の必要性を見極めて
+[04-roadmap.md](./04-roadmap.md) のロードマップに沿って積み増す。
