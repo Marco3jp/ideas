@@ -1,8 +1,7 @@
-# 02. 各サービスの取得・再生方式 調査メモ
+# 02. 裏付け調査メモ
 
-設計を「想像」で組まないように、各配信サービスについて
-**実際の仕様・既存実装** に当たった結果をここにまとめる。
-本書は設計判断の根拠資料であって、フロー図のための雰囲気記述ではない。
+各配信サービスの取得・再生方式と、バックエンド技術選定について、
+公式仕様・既存実装の挙動を確認した結果をまとめる。設計判断の根拠資料。
 
 ## 1. URL 単体からメタデータを取り出す（手動キュー前提のコア）
 
@@ -87,10 +86,10 @@ TVer の番組ページは **iframe 埋め込みが拒否され、かつ Widevin
 **設計上の結論:**
 
 - iframe 埋め込みは技術的・規約的に不可。
-- yt-dlp で抽出した m3u8 をアプリ内 `hls.js` で再生する経路（後述 Tier 2）も
+- yt-dlp で抽出した m3u8 をアプリ内 `hls.js` で再生する経路（後述 §2-3 Tier 2）も
   **DRM のため成立しない**（音声のみ・低画質に落としても結局再生キーが必要）。
 - したがって TVer をながら聞きキューに混ぜるためには、
-  **「ブラウザのタブ自体を再生面として使い、それを Chrome 拡張で自動制御する」（Tier 3）** しかない。
+  **「ブラウザのタブ自体を再生面として使い、それを Chrome 拡張で自動制御する」（§2-4 Tier 3）** しかない。
   公式プレイヤーを TVer 側のドメインで動かす形になり、DRM 制約も TVer 利用規約も
   ユーザのブラウザ通常利用と同じ枠で満たせる。
 
@@ -110,7 +109,7 @@ URL から oEmbed や RSS 経路でメタが取れなかったとき、
 - 取得は単純な HTTP GET + HTML 内 meta タグの抽出のみ（DOM パーサ不要、正規表現でも足りる）。
 - `User-Agent` を指定可能にする（サイトによっては Bot を除外する）。
 
-これがあるおかげで、**未対応プラットフォームでも URL を貼ってキューに積むこと自体は可能**。
+これがあるおかげで、**メタ取得が成功するプラットフォームのカバレッジが広い**。
 ただし「ながら聞き」を成立させるためには、再生経路として §2-1〜§2-4 のいずれか（Tier 1〜3）に
 落ちる必要がある。og:タグ単独はメタ取得用のフォールバックでしかない。
 
@@ -200,7 +199,6 @@ iframe 埋め込みが効かないが DRM が無いプラットフォームを�
 ### 2-4. Chrome 拡張モード（Tier 3）
 
 Tier 1／Tier 2 で再生不能なプラットフォーム（典型例: TVer）を「ながら聞き」可能にするための経路。
-**追加フィードバックで明示的に提案された案**。
 
 #### 仕組み
 
@@ -283,3 +281,92 @@ HLS（`X-Radiko-AuthToken` 必須）を取得する必要があり実装コス�
 
 導入する場合はバックエンドで auth フローを完結させ、
 HLS をフロントへプロキシ配信する構成になる。優先度は低（[04-roadmap.md](./04-roadmap.md)）。
+
+## 6. バックエンド技術選定
+
+本ツールの要件から導かれるバックエンドの技術的必要条件:
+
+- **単一プロセスで常駐**できる（systemd で 1 行登録できる）。
+- **SQLite ファイル**を扱う。
+- **WebSocket** を素直に喋れる（リアルタイム同期用、§4-6）。
+- **`yt-dlp` を子プロセスで呼ぶ**（Tier 2 のストリーム解決）。
+- **HLS マニフェスト／セグメントを中継**する（Tier 2 のプロキシ）。
+- **静的ファイル**（Vite ビルド出力）を配信する。
+- **Server-Sent Events** を喋れる（Tier 3 の拡張イベント受け口）。
+
+候補は **Node.js + TypeScript** と **Go** の 2 つに絞った。両者の比較を以下にまとめる。
+
+### 6-1. Node.js 26 + TypeScript の場合
+
+#### バージョン状況
+
+- **Node.js 26.0.0 は 2026-05-05 リリース**（Current）。
+- 2026-10 に Active LTS へ昇格予定。
+- Node.js の新リリース体制では「Current 6 ヶ月 → LTS 30 ヶ月、計 36 ヶ月サポート」に変更されている。
+- Temporal API がデフォルト有効、V8 14.6、Undici 8.0 等の更新。
+
+> 出典: nodejs.org の Release Schedule 案内ページ、
+> [github.com/nodejs/node releases v26.0.0](https://github.com/nodejs/node/releases/tag/v26.0.0)。
+
+#### ライブラリ構成
+
+| 役割 | 候補 |
+|---|---|
+| HTTP / 静的配信 / ルーティング | Hono（Node アダプタ）または素の Fastify |
+| SQLite | `better-sqlite3`（同期ドライバ、ネイティブモジュール） |
+| WebSocket | `ws` |
+| 静的ファイル同梱 | 別ディレクトリ配信、または `--experimental-sea-config` での Single Executable Application |
+| 子プロセス（yt-dlp） | `node:child_process` |
+
+### 6-2. Go の場合
+
+#### バージョン状況
+
+- Go は半年ごとのメジャーリリース。`go build` で単一バイナリが出る。
+- 純 Go の SQLite ドライバが本番採用可能になっており、CGo 不要。
+
+#### ライブラリ構成
+
+| 役割 | 候補 | 出典 |
+|---|---|---|
+| ルーティング | **Chi** | net/http に直接乗る軽量ルータ。ハンドラがフレームワーク非依存の `http.HandlerFunc` のままで済む |
+| SQLite | **`modernc.org/sqlite`** | pure Go / CGo 不要。SQLite 3.53.0 ベース。WAL モードで運用 |
+| WebSocket | **`github.com/coder/websocket`**（旧 `nhooyr.io/websocket`） | Go 作者陣推奨。Traefik / Vault / Cloudflare 採用。`context.Context` 統合、concurrent write を内部で扱う |
+| 静的ファイル同梱 | **標準の `embed.FS`** | Vite の `dist/` をバイナリに同梱できる |
+| 子プロセス（yt-dlp） | `os/exec` | 標準 |
+
+> 出典: pkg.go.dev / GitHub の公式ドキュメント、
+> [websocket.org の Go WebSocket Server Guide](https://websocket.org/guides/languages/go/)、
+> Coder のブログ「A New Home for nhooyr/websocket」。
+> なお `gorilla/websocket` は 2022 末にアーカイブされており、新規採用は推奨されない。
+
+### 6-3. 比較
+
+| 観点 | Node.js 26 + TS | Go |
+|---|---|---|
+| 配布 | `node + node_modules + dist` を配る（または SEA でバイナリ化、ただし native モジュール `better-sqlite3` は外出しが必要） | `go build` で **静的ファイルごと単一バイナリ**。systemd 常駐の手間が最小 |
+| 依存ランタイム | Node.js ランタイムをホストに用意（バージョン整合の管理コストあり） | 不要 |
+| ネイティブ依存 | `better-sqlite3` は OS × アーキ別の prebuild が要る | CGo 不要（`modernc.org/sqlite`） |
+| SQLite の API | 同期 API でシンプル | `database/sql` 経由でやや冗長だが、トランザクション・WAL 等は普通に書ける |
+| WebSocket | `ws` で枯れた書き方 | `coder/websocket` で `context.Context` 統合、メンテ活発 |
+| HLS プロキシ（ストリーミング転送） | Node の Stream で書ける | `io.Copy` で 1 行 |
+| 子プロセス（yt-dlp） | `child_process.spawn` で標準出力をパース | `os/exec` で標準出力をパース。`bufio.Scanner` で行単位処理が薄い |
+| フロントとの言語統一 | TS で統一 | バックエンドは Go、フロントは TS と分かれる |
+| 開発の立ち上げ速度 | npm 1 個でフロント・バック両方動く | `go run` と `pnpm dev` を分けて起動（ただし両方ともコマンド 1 行） |
+
+### 6-4. 結論
+
+**バックエンドは Go を採用する。** 決め手は以下:
+
+1. **単一バイナリ配布**: `go build` で Vite ビルド済みのフロントを `embed.FS` で同梱した
+   実行ファイル 1 つにできる。systemd は `ExecStart=/usr/local/bin/nagara` だけになり、
+   非機能要件「起動が面倒を避ける」「配布は単一バイナリを狙う」に対して最も素直。
+2. **CGo 不要**: `modernc.org/sqlite` で完全に純 Go。クロスコンパイル・配布の障害が消える。
+3. **WebSocket / HLS プロキシ / 子プロセス**の 3 つが、いずれも標準寄りの薄いコードで書ける
+   （`coder/websocket` / `io.Copy` / `os/exec`）。Node でも書けるが Go の方が依存数が少ない。
+4. **メンテされているライブラリだけで構成できる**: Chi（活発）／coder/websocket（活発）／
+   modernc.org/sqlite（活発）。`gorilla/websocket` のようにアーカイブされた依存を抱えなくて済む。
+
+フロントは TypeScript で書く前提を維持する（Vite + React + TS）。
+言語が二分されるデメリットは認めるが、配布と運用の単純さで補って余りある。
+

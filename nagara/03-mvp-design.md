@@ -1,56 +1,57 @@
 # 03. MVP 設計
 
-「**まずミニマムに作ってみてから考える**」「**自動キュー化より先に手動キューを作る**」
-「**「ながら聞き」コンセプトを破綻させない**」という依頼方針に従い、
-本書は MVP として実装すべき最小構成だけを書く。
+「ミニマムに作って触ってから本設計に落とす」方針に従い、本書は MVP として実装すべき
+最小構成だけを書く。要件は [01-requirements.md](./01-requirements.md)、
+技術判断の根拠は [02-research.md](./02-research.md) を参照。
 
 ## 1. コンセプト
 
 - **「次これ見よう」をプラットフォーム横断で 1 本のキューに積み、頭から消化する**ツール。
-- 入口は **URL 1 本貼って Enter**。チャンネル登録・自動クロール・おすすめは MVP では作らない。
-- ながら聞きを成立させるため、**エピソードの切り替わりに人間操作を要求しない** ことが必達制約。
-- 再生経路は **3 つの Tier**（Tier 1: ネイティブ埋め込み／Tier 2: yt-dlp+hls.js／
-  Tier 3: Chrome 拡張モード）から、URL に応じて自動選択。
-  「外部タブ＋手動進行」（旧版にあった Tier 4 相当）は **コンセプトを破綻させるので採用しない**。
+- 入口は **URL 1 本貼って Enter**。投入用に **メイン UI** と **スマホ向け補助 UI** の 2 系統を持ち、
+  状態は WebSocket でリアルタイム同期する。
+- 「ながら聞き」を成立させるため、**エピソードの切り替わりに人間操作を要求しない** ことが必達制約。
+  再生経路は 3 つの Tier から URL に応じて自動選択する。
+- **割り込み再生**（スタック復帰）で、いま見たいものを差し込んでも元の動画位置から戻れる。
 
 ## 2. 全体像
 
 ```
-┌──────────── Linux PC（自宅 LAN 内、常駐） ────────────┐
-│                                                       │
-│  ┌──────────────┐    ┌─────────────────────────┐      │
-│  │ nagara API   │←──→│ better-sqlite3 (file)  │      │
-│  │ (Hono/Node)  │    │ ./data/nagara.db        │      │
-│  │              │    └─────────────────────────┘      │
-│  │  ・メタ取得（oEmbed / og:tags / RSS）              │
-│  │  ・yt-dlp 子プロセス起動 → m3u8 解決               │
-│  │  ・HLS プロキシ（CORS 解消とトークン付与）         │
-│  │  ・拡張からの ended 通知の受け口（SSE/WS）         │
-│  └──────┬───────┘                                     │
-│         │ Static files                                │
-│  ┌──────▼───────┐                                     │
-│  │ nagara Web   │                                     │
-│  │ (静的 SPA)   │                                     │
-│  └──────────────┘                                     │
-└─────────────────────┬─────────────────────────────────┘
-                      │ HTTP (LAN)
-               ┌──────▼───────┐
-               │ Windows PC   │ Chrome で http://nagara.local:<port>
-               │ (Chrome)     │ ＋ nagara Chrome 拡張（Tier 3 用）
-               └──┬───────────┘
-                  │
-                  ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │ Tier 1: YouTube IFrame Player API / <audio>             │
-   │ Tier 2: <video> + hls.js（バックエンドプロキシ越し）    │
-   │ Tier 3: 拡張が制御する別タブ（YouTube 拒否動画 / TVer 等)│
-   └─────────────────────────────────────────────────────────┘
+┌──────────── Linux PC（自宅 LAN 内、常駐） ────────────────┐
+│                                                          │
+│  ┌──────────────────────────────────────┐                │
+│  │ nagara (Go 単一バイナリ)             │                │
+│  │  ・REST API（Chi）                   │                │
+│  │  ・WebSocket（coder/websocket）      │ ←─→ SQLite     │
+│  │  ・HLS プロキシ                       │     ファイル   │
+│  │  ・yt-dlp 子プロセス制御              │                │
+│  │  ・Vite ビルド済みフロントを embed.FS │                │
+│  │    で同梱して静的配信                  │                │
+│  └──────────────────────────────────────┘                │
+│            ▲                  ▲                          │
+│            │ HTTP/WS          │ SSE/HTTP                 │
+└────────────┼──────────────────┼──────────────────────────┘
+             │                  │
+   ┌─────────┴─────────┐    ┌───┴──────────────────┐
+   │ Windows PC        │    │ スマホ                │
+   │ Chrome（メイン UI）│    │ Chrome（補助 UI /quick）│
+   │ + nagara 拡張     │    └──────────────────────┘
+   └───────┬───────────┘
+           │
+           ▼
+ ┌────────────────────────────────────────────────┐
+ │ Tier 1: YouTube IFrame / <audio>               │
+ │ Tier 2: <video> + hls.js（バックエンドプロキシ越し）│
+ │ Tier 3: 拡張が制御する別タブ                    │
+ └────────────────────────────────────────────────┘
 ```
 
 ポイント:
+
+- 配布物は **Go バイナリ 1 個と SQLite ファイル 1 個**。
+- フロント（メイン UI と補助 UI）は同一 SPA。`/` がメイン、`/quick` が補助。
 - Tier 1／Tier 3 のメディアストリームはサーバを経由しない。
-- **Tier 2 のみバックエンドが HLS プロキシを兼ねる**（CORS／トークン期限の問題を一箇所で吸収）。
-- バックエンドの外部通信は「メタ取得」「`yt-dlp -j ...` 実行」「HLS プロキシの中継」の 3 系統。
+- **Tier 2 のみバックエンドが HLS プロキシを兼ねる**（CORS／トークン期限を一箇所で吸収）。
+- バックエンドの外部通信は「メタ取得」「`yt-dlp` 実行」「HLS プロキシの中継」の 3 系統。
 
 ## 3. デプロイ戦略
 
@@ -58,40 +59,42 @@
 
 ### 採用: Linux PC で systemd 常駐
 
-- `node dist/server.js` を `nagara.service` として登録。
-- フロントとバックエンドは **同一プロセス／同一ポート** で配信（Hono が静的ファイルもサーブ）。
-  → CORS 設定不要、起動コマンドが 1 個になる。
+- `go build` で出した **単一バイナリ**を `/usr/local/bin/nagara` に置く。
+- `nagara.service` の `ExecStart=/usr/local/bin/nagara` で常駐。
+- フロントは `embed.FS` でバイナリに同梱しているため、別途配置不要。
 - ブラウザは `http://<linux-ip>:<port>` を開きっぱなしにしておけば再起動なしで使える。
 
-### 不採用: Windows PC で常駐／Docker Compose
+### 不採用: Docker Compose
 
-理由は前回の設計と同じ（タスクトレイ常駐の作り込み・Docker Engine 前提が「起動が面倒」要件に逆行）。
+- 単一バイナリで完結する構成に対して、Docker Engine の前提は重い。
+- 「起動が面倒」要件に逆行する。
 
 ## 4. 採用技術スタック
 
-「ミニマム」と「ローカル単体起動」を最優先。Tier 2／Tier 3 を成立させるための追加要素も明示。
+「ミニマム」「ローカル単体起動」「単一バイナリ配布」を最優先。
 
-| レイヤ | 採用 | 不採用と理由 |
+| レイヤ | 採用 | 補足 |
 |---|---|---|
-| バックエンドランタイム | Node.js 22 LTS + TypeScript | — |
-| バックエンドフレームワーク | **Hono**（Node アダプタ） | 静的配信＋ルーティング＋型推論が短く書ける |
-| DB | **`better-sqlite3`**（同期ドライバ） | ORM は MVP では過剰 |
-| マイグレーション | 起動時に `CREATE TABLE IF NOT EXISTS` を流すだけ | drizzle-kit/prisma migrate は不要 |
-| RSS / HTML パース | `fast-xml-parser` ＋ 正規表現での meta タグ抽出 | jsdom は重い |
-| 動画ストリーム解決（Tier 2） | **`yt-dlp` バイナリを子プロセスで `-j` 実行** | サーバー側に同梱（`scripts/install.sh` で自動取得）。Node ライブラリのラッパは挙動が枯れていない |
-| HLS プロキシ（Tier 2） | Hono の素のルートで `fetch` → ストリーム転送 | 専用プロキシサーバを立てる必要なし |
-| 本体 ↔ 拡張通信（Tier 3 / 本体 → 拡張） | **`externally_connectable` + `chrome.runtime.sendMessage`** | postMessage より素直に MV3 で動く |
-| 拡張 → 本体通信（Tier 3 / イベント通知） | **SSE（`text/event-stream`）** | ブラウザ側の追加ライブラリ不要。WebSocket は MVP には重い |
-| フロントビルド | **Vite + React + TypeScript** | Next.js は SSR 不要なので過剰 |
+| バックエンド言語 | **Go** | バイナリ 1 個で配布。理由は [02-research.md](./02-research.md) §6-4 |
+| ルーティング | **`github.com/go-chi/chi/v5`** | net/http に直接乗る軽量ルータ |
+| WebSocket | **`github.com/coder/websocket`** | Go 作者陣推奨、メンテ活発 |
+| DB | **`modernc.org/sqlite`** | pure Go、CGo 不要。WAL モードで運用 |
+| 静的ファイル同梱 | **標準 `embed.FS`** | Vite の `dist/` を同梱 |
+| 子プロセス（yt-dlp） | **`os/exec`** | 標準 |
+| HLS プロキシ | **`net/http` + `io.Copy`** | マニフェスト書換は自前実装 |
+| マイグレーション | 起動時に `CREATE TABLE IF NOT EXISTS` を流す | drizzle-kit 等は使わない |
+| RSS / HTML パース | 標準 `encoding/xml` ＋ 正規表現での meta タグ抽出 | DOM パーサは使わない |
+| フロントビルド | **Vite + React + TypeScript** | メイン UI と補助 UI を 1 つの SPA で配信 |
 | HLS 再生 | **`hls.js`**（Tier 2 専用） | Chrome は HLS をネイティブで `<video>` に流せないため必須 |
-| Chrome 拡張 | **MV3、TypeScript で書く小さなモノレポ** | 配布は MVP では開発者モード読込み。CWS 公開は将来 |
-| 状態管理 | `useState` / `useReducer` のみ | Zustand/Redux は不要 |
-| HTTP クライアント | 素の `fetch` | SWR/React Query は不要 |
-| スタイル | CSS Modules（ベタ書き） | Tailwind/shadcn は導入コスト > 効用 |
+| Chrome 拡張 | **MV3、TypeScript で書く小さなモノレポ** | 配布は MVP では開発者モード読込み |
+| 状態管理 | `useState` / `useReducer` のみ。WebSocket は 1 つのコンテキストで配信 | Zustand/Redux は不要 |
+| HTTP クライアント | 素の `fetch` | SWR/React Query は不要（WS で push されるため） |
+| スタイル | CSS Modules | Tailwind/shadcn は導入コスト > 効用 |
 
 ## 5. データモデル
 
-SQLite。テーブル 4 個。`source_kind` は **再生方式（Tier）** とほぼ 1 対 1 対応する。
+SQLite。テーブル 4 個。`source_kind` は **再生方式（Tier）** と 1 対 1 対応する。
+`queue_items` は通常キューと割り込みスタックを 1 テーブルで表現する。
 
 ```sql
 -- アイテム（キューに入れた／入っていた 1 件）
@@ -107,30 +110,35 @@ CREATE TABLE IF NOT EXISTS items (
   external_id   TEXT,                              -- youtube_embed: videoId / 他: 任意
   media_url     TEXT,                              -- audio_file: 直リン URL / ytdlp_stream: マニフェスト URL（プロキシ前） / 他: NULL
   stream_kind   TEXT,                              -- ytdlp_stream のとき 'hls' | 'progressive'
-  title         TEXT,                              -- メタ取得後に埋まる
-  author        TEXT,                              -- 投稿者名／チャンネル名／サイト名
+  title         TEXT,
+  author        TEXT,
   thumbnail_url TEXT,
   duration_seconds INTEGER,
-  meta_status   TEXT NOT NULL DEFAULT 'pending'    -- 'pending' | 'ok' | 'failed'
+  meta_status   TEXT NOT NULL DEFAULT 'pending'
                   CHECK (meta_status IN ('pending', 'ok', 'failed')),
   meta_error    TEXT,
-  resolution_status TEXT NOT NULL DEFAULT 'pending' -- ytdlp_stream の m3u8 解決状態
+  resolution_status TEXT NOT NULL DEFAULT 'pending'
                   CHECK (resolution_status IN ('pending', 'ok', 'failed', 'na')),
   resolved_at   TEXT,                              -- ytdlp_stream の URL は短期失効するので保存時刻も記録
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- キュー（順序付き、いま再生中もこのテーブルで表現）
+-- キュー＋割り込みスタックを 1 テーブルで表現
 CREATE TABLE IF NOT EXISTS queue_items (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  position    INTEGER NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'queued'
-                CHECK (status IN ('queued', 'playing')),
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id           INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  status            TEXT NOT NULL
+                      CHECK (status IN ('queued', 'playing', 'paused_for_interrupt')),
+  position          REAL,                          -- queued: 順序キー。playing/paused_for_interrupt: NULL
+  paused_at_seconds INTEGER,                       -- paused_for_interrupt のとき、停止時点の再生位置（秒）
+  interrupts_id     INTEGER REFERENCES queue_items(id) ON DELETE SET NULL,
+                                                     -- 割り込み中アイテムが「誰を割り込んだか」を指す
+  created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_queue_position ON queue_items(position);
+CREATE INDEX IF NOT EXISTS idx_queue_interrupts ON queue_items(interrupts_id);
+-- いま再生中は 1 件だけ
 CREATE UNIQUE INDEX IF NOT EXISTS uq_queue_one_playing
   ON queue_items(status) WHERE status = 'playing';
 
@@ -145,7 +153,7 @@ CREATE TABLE IF NOT EXISTS history (
 );
 CREATE INDEX IF NOT EXISTS idx_history_item ON history(item_id);
 
--- KV 設定（ザッピング間隔等）
+-- KV 設定
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -153,25 +161,31 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 ```
 
-設計上のメモ:
+### 5-1. 設計上のメモ
 
 - `items` と `queue_items` を分離した理由は **「履歴に残った行を再キューしたい」** から。
   キューから消えた瞬間に `items` ごと削除すると、履歴・再追加で URL のメタを再取得する羽目になる。
-- `queue_items.status = 'playing'` を最大 1 件に制限する部分インデックス（SQLite 3.8.0+）で
-  「いま再生中はキュー全体で 1 件まで」を DB レベルで保証する。
-  → アプリ側のロックを書かずに済む。
-- 同じ `item_id` をキューに複数回入れることは許容（同じ URL を 2 回流したい用途のため）。
-- `position` の連番管理は「常にゼロ詰めで再採番」ではなく **疎な整数で運用** し、
-  「2 と 3 の間に挿入したいときは 2.5 → 整数化を後でやる」みたいなことはしない。
-  挿入のたびに `UPDATE queue_items SET position = position + 1 WHERE position >= ?` でずらす
-  シンプルな方式で十分（数十〜数百件しか並ばない想定なので速度問題は起きない）。
+- `queue_items.status='playing'` は部分ユニークインデックスで「全体で 1 件まで」を DB レベル保証。
+- `position` は **疎な浮動小数（REAL）** で管理し、間に挿入する時は中央値を取って採番する
+  （`(prev.position + next.position) / 2`）。これにより並び替え／先頭挿入で全行 UPDATE する必要がなくなる。
+  値が極端に細かくなったら起動時にリバランスする（数十〜数百件想定なので頻度は低い）。
 - `resolution_status` と `resolved_at` を持つ理由: yt-dlp 由来の m3u8 はトークン付きで
-  数十分〜数時間で失効する。再生開始時に `resolved_at` から経過時間が一定以上なら
-  「再解決」を走らせる必要があるため、状態を保持しておく。
+  数十分〜数時間で失効する。再生開始時に `resolved_at` の経過時間を見て、必要なら再解決する。
+
+### 5-2. 割り込みスタックの表現
+
+- 通常再生: 該当行 `status='playing'`, `position=NULL`, `interrupts_id=NULL`。
+- 割り込み中: 直前まで再生中だった行を `status='paused_for_interrupt'` に更新し、
+  `paused_at_seconds` に再生位置を保存。割り込みアイテムを新規作成し
+  `status='playing'`, `interrupts_id=<割り込まれた側の id>` に。
+- 多段の割り込み: 上記を再帰的に繰り返す。`interrupts_id` のチェーンがスタックを成す。
+- 復帰: `playing` を `history` へ移して削除した後、`interrupts_id` が `NULL` でない場合は
+  そのチェーンを辿って最も新しい `paused_for_interrupt` を `playing` に戻す。
+  フロントには `paused_at_seconds` を返してシークさせる。
 
 ## 6. バックエンド API
 
-すべて `application/json`。エラーは HTTP ステータス + `{ "error": "..." }`。
+すべて `application/json`（ストリーム系を除く）。エラーは HTTP ステータス + `{ "error": "..." }`。
 認証なし（LAN 限定）。
 
 ### 6-1. アイテム（メタ取得）
@@ -181,57 +195,80 @@ CREATE TABLE IF NOT EXISTS settings (
 | POST | `/api/items` | `{ url }` を受け取って `items` に保存し、メタ取得をキック |
 | GET  | `/api/items/:id` | アイテム 1 件取得（メタ取得状態の確認用） |
 | POST | `/api/items/:id/refetch` | メタ取得を再試行 |
+| POST | `/api/items/:id/resolve` | Tier 2 用の yt-dlp 再解決（短期失効した m3u8 用） |
 
 `POST /api/items` の処理フロー:
 
 ```
 1. URL を正規化（fragment 除去等）
-2. URL から source_kind（= 採用 Tier）を判定
+2. URL から source_kind（採用 Tier）を判定
    ├ youtube.com / youtu.be / shorts / live    → 'youtube_embed'  (Tier 1)
    ├ Content-Type が audio/* または .mp3 .m4a .ogg .aac → 'audio_file' (Tier 1, HEAD で判定)
    ├ tver.jp / その他「埋め込み拒否＋DRM」既知ホスト → 'extension_tab' (Tier 3)
    └ それ以外                                  → 'ytdlp_stream'   (Tier 2 候補)
 3. items に INSERT (meta_status='pending', resolution_status='pending'|'na')
-4. メタ取得を非同期で実行（プロセス内のキュー、せいぜい 4 並列）
+4. メタ取得を goroutine で非同期実行（並列数は設定で制限）
    ├ youtube_embed  → oEmbed
    ├ audio_file     → HEAD で Content-Length, ファイル名から title 推定
    ├ ytdlp_stream   → yt-dlp -j で JSON 取得 → title/uploader/thumbnail を取り出す
    └ extension_tab  → og:* を正規表現で抽出（HTML を GET）
 5. ytdlp_stream のときは続けて解決処理:
-   ├ formats[] に DRM-only / 空 / 音声のみ → resolution_status='failed' に落として
+   ├ formats[] が空 / DRM-only / 音声のみ → resolution_status='failed' に落とし、
    │   source_kind を 'extension_tab' に降格（Tier 3 へフォールバック）
    ├ HLS が取れる → media_url=manifest_url, stream_kind='hls', resolution_status='ok'
    └ progressive が取れる → media_url=直リン, stream_kind='progressive', resolution_status='ok'
-6. items を UPDATE
+6. items を UPDATE → WebSocket で item_meta_updated を broadcast
 ```
-
-`youtube_embed` も Tier 1 で再生失敗（`onError` 101/150）した場合に、
-クライアント側から `POST /api/items/:id/refetch?fallback=ytdlp` を呼んで Tier 2 → Tier 3 に
-降格させる経路を用意する。
 
 メタ取得は失敗してもキュー再生は破綻しない（再生は URL 直で出来るので、見出しが空のまま再生される）。
 
-### 6-2. キュー操作（コア）
+### 6-2. キュー操作
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| GET    | `/api/queue` | 現在のキューを `position` 昇順で返す（`status` 含む） |
-| POST   | `/api/queue` | `{ url }` でキュー末尾に追加（内部で `POST /api/items` と同等の処理＋キュー追加） |
-| POST   | `/api/queue/insert-next` | `{ url }`：いま再生中の **次** に挿入 |
-| PATCH  | `/api/queue/:id` | `{ position }` の差し替え（並び替え） |
+| GET    | `/api/queue` | 現在のキュー全体（通常キュー＋playing＋割り込みスタック）を返す |
+| POST   | `/api/queue` | `{ url }` でキュー末尾に追加（内部で `POST /api/items` 相当の処理＋キュー追加） |
+| POST   | `/api/queue/insert-next` | `{ url }`：いま再生中の次に来る位置に挿入（position を `playing` の論理直後に） |
+| POST   | `/api/queue/play-now` | `{ url }`：今すぐ割り込みで見る（後述） |
+| PATCH  | `/api/queue/:id` | `{ position }` を変更して並び替え |
 | DELETE | `/api/queue/:id` | キューから削除（履歴 status='removed' を 1 行追加） |
-| POST   | `/api/queue/play` | `{ queueItemId }` を `status='playing'` に。直前の `playing` は完了として履歴へ |
-| POST   | `/api/queue/complete` | `{ progressSeconds, status }` を受けて、いま `playing` の行を履歴に移して削除 |
+| POST   | `/api/queue/skip` | いま再生中を `skipped`（progress_seconds 付き）として終了し次へ |
+| POST   | `/api/queue/complete` | 自然終了による次への遷移。割り込みスタックがあれば復帰、無ければキュー先頭を pop |
 
-`POST /api/queue/play` の動作:
-- 直前の `playing` 行があれば、それを **`history`（status='skipped'）に移して削除**。
-- 指定 `queueItemId` を `status='playing'` に更新。
-- レスポンスとして「いま再生中のアイテムの全情報」と「次の queue_item」を返す。
+すべての操作の結果は `queue_updated` イベントとして WebSocket で broadcast される。
 
-`POST /api/queue/complete` の動作:
-- `body.status` は `'completed' | 'skipped'`。
-- `playing` の行を見つけて `history` に INSERT、`queue_items` から削除。
-- 次のキュー先頭を返す（あれば）。
+`POST /api/queue/play-now` の動作:
+
+```
+1. items を作成（POST /api/items 相当）。
+2. 現在 playing の queue_item Q があれば:
+   ├ Q.status を 'paused_for_interrupt' に更新
+   ├ body の paused_at_seconds（フロントから送られる再生位置）を保存
+3. 新しい queue_item I を作成:
+   ├ status = 'playing'
+   ├ position = NULL
+   ├ interrupts_id = Q.id（Q が無ければ NULL）
+4. WebSocket で broadcast。
+5. レスポンスとして再生に必要な情報（item と I）を返す。
+```
+
+`POST /api/queue/complete` の動作（自然終了による次へ）:
+
+```
+1. いま playing の queue_item X を history に移す（status='completed', progress_seconds=null）。
+2. X を queue_items から削除。
+3. X.interrupts_id が指す Y を SELECT。Y がいれば:
+   ├ Y.status を 'paused_for_interrupt' から 'playing' に戻す。
+   ├ Y.paused_at_seconds を返してフロントにシークさせる。
+4. Y が無ければ通常キュー先頭（position 最小の queued）を 'playing' に昇格。
+5. WebSocket で playback_changed と queue_updated を broadcast。
+```
+
+`POST /api/queue/skip` の動作（ユーザによる飛ばし）:
+
+- `complete` とほぼ同じだが、history への `status` が `skipped`、
+  body から `progress_seconds` を受け取って history と paused_at_seconds に反映。
+- 割り込み中の skip は「割り込みアイテムを破棄して元に戻る」と同じ意味になる。
 
 ### 6-3. 履歴
 
@@ -240,65 +277,63 @@ CREATE TABLE IF NOT EXISTS settings (
 | GET  | `/api/history?limit=100` | 最新の履歴 |
 | POST | `/api/history/:id/requeue` | 履歴の行をキュー末尾に再投入（同じ `item_id` で `queue_items` を作る） |
 
-### 6-3b. Tier 2 — yt-dlp 解決と HLS プロキシ
+### 6-4. Tier 2 — HLS プロキシ
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| POST | `/api/items/:id/resolve` | yt-dlp を再実行してメタ＋ストリームを再解決（短期失効した m3u8 の再取得用） |
-| GET  | `/api/stream/:itemId/manifest.m3u8` | items のマニフェストをバックエンドが取得して中継。`Access-Control-Allow-Origin: *` 付与、必要に応じてトークンも付与 |
-| GET  | `/api/stream/:itemId/segment?u=<encoded-url>` | 上記マニフェスト内のセグメント URL を引数として受け取り、同じバックエンドが中継 |
-
-`/api/stream/.../manifest.m3u8` の中身は **マニフェスト本体を書き換えて、セグメント URL を
-`/api/stream/:itemId/segment?u=<encoded>` の形に差し替える**。これで CORS とトークン管理を
-一箇所に閉じ込められる（[02-research.md](./02-research.md) §2-3）。
+| GET | `/api/stream/:itemId/manifest.m3u8` | items のマニフェストをバックエンドが取得して中継。`Access-Control-Allow-Origin: *` 付与、必要に応じてトークンも付与。マニフェスト本体は **セグメント URL を `/api/stream/:itemId/segment?u=<encoded>` に書き換えた**ものを返す |
+| GET | `/api/stream/:itemId/segment` | 上記マニフェストから呼ばれるセグメントを中継 |
 
 セキュリティ:
 
-- `:itemId` で referencing されたアイテム以外の任意 URL は中継しない。
+- `:itemId` で参照されたアイテム以外の URL は中継しない。
 - セグメント URL は **マニフェスト解析時に DB 側で許可リストに追加**したホストのみ通す。
 - これにより SSRF を構造的に防止する。
 
-### 6-3c. Tier 3 — Chrome 拡張連携
+### 6-5. Tier 3 — Chrome 拡張連携
 
 | Method | Path | 振る舞い |
 |---|---|---|
-| POST | `/api/extension/play` | 本体 → 拡張へ「このタブ ID／URL で再生開始してくれ」を投げる（実態は `extension_state` に書いて、SSE で push） |
-| GET  | `/api/extension/events` | SSE。拡張が `chrome.runtime.sendMessage` で本体に通知した `ended` / `error` / `progress` を、本体フロントへ流す |
-| POST | `/api/extension/event` | 拡張のサービスワーカーが本体へ送る通知（HTTP POST。これを受けて本体は `extension_state` 更新と `/api/extension/events` への push を行う） |
+| POST | `/api/extension/play` | 本体 → 拡張へ「このタブで再生開始してくれ」を投げる |
+| POST | `/api/extension/event` | 拡張のサービスワーカーが本体へ送る通知（`ended` / `error` / `progress`） |
 
-> 拡張からは `externally_connectable` で本体（http://nagara.local:port）の HTTP API を直接叩いてもよい。
-> ただし MV3 の service worker は短命なので、長時間の SSE 購読には向かない。
-> **方向ごとに通信路を分ける**: 本体→拡張は `chrome.runtime.sendMessage`、
-> 拡張→本体は `fetch`（短命 POST）。両方とも MV3 のサンプル実装で実証済みのパターン。
+詳細フローは §7-4。
 
-詳細フローは §7-2c。
+### 6-6. WebSocket
 
-### 6-4. 設定
+| Path | 振る舞い |
+|---|---|
+| `GET /api/ws` | WebSocket ハンドシェイク。接続後はサーバ → クライアントの片方向 push がメイン |
 
-| Method | Path | 振る舞い |
+クライアントへ push されるイベント（type で識別）:
+
+| `type` | payload | 発火タイミング |
 |---|---|---|
-| GET    | `/api/settings` | KV 全件 |
-| PATCH  | `/api/settings` | KV 部分更新 |
+| `queue_updated` | 現キュー全体のスナップショット | キューの追加・削除・並び替え・割り込み・復帰 |
+| `item_meta_updated` | 該当 `item` の最新スナップショット | メタ取得完了／yt-dlp 解決完了／降格 |
+| `playback_changed` | `{ playing: queueItem, paused_at_seconds: number? }` | 自然遷移／割り込み／復帰 |
+| `extension_event` | `{ kind, itemId, ... }` | 拡張からの ended/error/progress を中継 |
 
-主要キー:
-| key | 型 | デフォルト | 説明 |
-|---|---|---|---|
-| `zapping_timeout_seconds` | number | `0`（無効） | エピソード再生開始から自動スキップまでの秒数 |
-| `zapping_grace_seconds` | number | `10` | 「続き見る？」表示時間 |
-| `default_playback_rate` | number | `1.0` | 再生速度デフォルト |
-| `outbound_user_agent` | string | 空 | サーバが外部メタ取得時に使う UA（環境変数 `OUTBOUND_USER_AGENT` でも可） |
+クライアント → サーバの方向は基本使わない（REST API を叩く）。
+ping/pong は coder/websocket の標準機能で扱う。
+
+サーバ側の実装方針:
+
+- 接続を保持する **Hub** を 1 つ持つ（goroutine + チャネル）。
+- 状態変更を起こす全 API は、コミット後に `hub.broadcast(event)` を呼ぶ。
+- 多数のクライアントは想定しない（同一 LAN の数台程度）が、ブロードキャスト時の
+  チャネル詰まりは select + default-drop でクライアント側を切断する。
 
 ## 7. フロントエンド設計
 
-画面は最小 3 つ（前回より 1 つ減らした）。
+ルートは 4 つ。すべて同一 SPA の中。
 
 ```
-/                ← プレイヤー（メイン画面、キューも横に並ぶ）
+/                ← メインプレイヤー画面（プレイヤー＋キュー＋設定ドロワー）
+/quick           ← 補助 UI（軽量・スマホ前提）
 /history         ← 履歴（読み取り＋再投入）
-/settings        ← 設定（ザッピング・UA 等）
+/settings        ← 設定（UA 等）
 ```
-
-「チャンネル一覧」画面は MVP では存在しない（チャンネル管理機能が無いため）。
 
 ### 7-1. メインプレイヤー画面
 
@@ -322,34 +357,68 @@ CREATE TABLE IF NOT EXISTS settings (
 │   タイトル / 投稿者 / 公開日 │   ─ URL を貼ってキュー追加 ─  │
 │                             │   ┌─────────────────────┐    │
 │   [▶/⏸] [⏭次へ] [×1.0 ▾]   │   │ https://...        │    │
-│   [全画面]                  │   └────────────[追加]┘     │
+│   [全画面] [今すぐ割り込み] │   └─────────[追加][割込]┘   │
 └────────────────────────────┴───────────────────────────────┘
 ```
 
 主要な UI 要素:
+
 - 右ペイン上部に **キュー**（ドラッグで並び替え／× で削除）。
-- 右ペイン下部に **URL 入力欄**。Enter または「追加」で末尾追加。
-  - 入力値が複数行なら 1 行ずつまとめて追加（コピペで複数 URL 投入する用途）。
-- いま再生中のアイテムは右ペインの **キュー 0 行目** として強調表示する
-  （`queue_items.status='playing'` の行）。
-- 「次これ再生」アクションはコンテキストメニュー（右クリック）or 各行のメニューから。
+- 右ペイン下部に **URL 入力欄**。「追加」（末尾追加）と「割込」（今すぐ割り込み）が並ぶ。
+- いま再生中のアイテムは右ペインの **キュー 0 行目** として強調表示する。
+- **割り込み中**は、現在再生中の上に「←〇〇に戻る予定」の小さな表示を出す。
+  スタック深度が 2 以上ある場合はチェーンを示す（「← A に戻る予定 ← B に戻る予定」）。
+- WebSocket からのイベントで、キュー一覧／プレイヤー上部情報／割り込み表示が即時更新される。
 
-### 7-2. PlayerAdapter インターフェイス
+### 7-2. 補助 UI（`/quick`）
 
-「ドメインごとにロード／再生／一時停止／見終わり／速度／フルスクリーンを統一」する要件への
-唯一の抽象化レイヤー。MVP では実装 4 つ。**外部タブ手動進行のアダプタは存在しない**
-（コンセプト破綻のため設計から除外）。
+スマホブラウザで快適に開けるシンプルなページ。
+
+```
+┌──────────────────────────┐
+│ nagara quick add          │
+├──────────────────────────┤
+│ URL                       │
+│ ┌────────────────────┐    │
+│ │ https://...        │    │
+│ └────────────────────┘    │
+│                           │
+│ [    末尾に追加    ]      │
+│ [    次に再生      ]      │
+│ [  今すぐ割り込み  ]      │
+│                           │
+│ 直近の追加（5件）          │
+│  ・タイトル A             │
+│  ・...                    │
+└──────────────────────────┘
+```
+
+実装方針:
+
+- 同一 SPA のサブルート（`/quick`）。React コンポーネントを 1 ファイルで完結させ、
+  メイン UI と共有するコードは型・API クライアントだけにする。
+- スマホからの操作を想定し、ボタンを十分に大きく、入力欄は OS のクリップボード貼り付けがしやすい配置に。
+- 直近の追加履歴は WebSocket の `queue_updated` を購読して受け取る
+  （補助 UI 側も最新状態を反映する）。
+- 共有メニュー連携:
+  - PWA 化（`manifest.webmanifest`）して、スマホのホーム画面に追加できるようにする。
+  - **`/quick?url=...`** をクエリで受けて初期値に入れる
+    → ブラウザの共有メニューから URL クエリつきで叩く形を実現できる。
+
+### 7-3. PlayerAdapter インターフェイス
+
+「ドメインごとに操作を統一」する唯一の抽象化レイヤー。MVP では実装 4 つ。
 
 ```ts
 type PlayerEvent =
   | { type: "ended" }
   | { type: "error"; code: string; message: string }
-  | { type: "fallback_required"; toTier: 2 | 3 }    // 上位 Tier から下位への降格依頼
+  | { type: "fallback_required"; toTier: 2 | 3 }
   | { type: "needs_user_action"; reason: "autoplay_blocked" | "extension_missing" };
 
 interface PlayerAdapter {
   mount(container: HTMLElement): Promise<void>;
-  load(item: Item): Promise<void>;
+  load(item: Item, startAtSeconds?: number): Promise<void>;
   play(): Promise<void>;
   pause(): Promise<void>;
   setRate(rate: number): Promise<void>;
@@ -360,172 +429,170 @@ interface PlayerAdapter {
 }
 ```
 
+`load(item, startAtSeconds)` の `startAtSeconds` は **割り込み復帰時のシーク**に使う。
+
 | 実装 | Tier | 中身 |
 |---|---|---|
-| `YouTubeEmbedAdapter` | 1 | `<div>` に YouTube IFrame Player API で `YT.Player` を生成。`onStateChange` の `ENDED` を `ended` に。`onError` 101/150 の場合は `fallback_required(toTier=2)` を発火 |
-| `AudioFileAdapter` | 1 | `<audio>` を生成。`ended`／`error` を変換。`playbackRate` で速度。フルスクリーンは無効 |
-| `HlsVideoAdapter` | 2 | `<video>` を生成し、`hls.js` で `/api/stream/:id/manifest.m3u8` をロード。`ended` / `error` をそのまま転送。フルスクリーンはコンテナで `requestFullscreen()` |
-| `ExtensionTabAdapter` | 3 | 拡張インストール状態を `chrome.runtime.sendMessage(EXT_ID, {type:'ping'})` で確認。未インストールなら `needs_user_action(extension_missing)` を発火し再生を停止。インストール済みなら `POST /api/extension/play` を投げ、SSE 経由で `ended` を待ち受ける |
+| `YouTubeEmbedAdapter` | 1 | YouTube IFrame Player API。`onStateChange` の `ENDED` を `ended` に。`onError` 101/150 で `fallback_required(toTier=2)` を発火。シーク復帰は `seekTo(startAtSeconds, true)` |
+| `AudioFileAdapter` | 1 | `<audio>` を生成。`ended`／`error` を変換。シーク復帰は `audio.currentTime = startAtSeconds` |
+| `HlsVideoAdapter` | 2 | `<video>` を生成し、`hls.js` で `/api/stream/:id/manifest.m3u8` をロード。`Hls.Events.MANIFEST_PARSED` の後にシーク。`ended`/`error` をそのまま転送 |
+| `ExtensionTabAdapter` | 3 | 拡張インストール状態を確認。未インストールなら `needs_user_action(extension_missing)` を発火。インストール済みなら `POST /api/extension/play` を投げ、WebSocket の `extension_event` を待ち受ける |
 
-### 7-2c. Tier 3（Chrome 拡張モード）の往復シーケンス
+### 7-4. Tier 3（Chrome 拡張モード）の往復シーケンス
 
 ```
-[本体フロント]                                           [本体バックエンド]
-     │                                                          │
-     │ POST /api/extension/play  { itemId, sourceUrl }          │
-     ├─────────────────────────────────────────────────────────►│
-     │                                                          │
-     │ ◄── chrome.runtime.sendMessage（SSE/直接 fetch どちらでも）
-     │                                                          │
-[Chrome 拡張 service worker]                                    │
-     │                                                          │
-     │ chrome.tabs.create({ url: sourceUrl, active: true })     │
-     │                                                          │
-[コンテンツスクリプト（対象ドメインで動く）]                     │
-     │                                                          │
-     │ document.querySelector('video') を監視                   │
-     │ video.addEventListener('ended', ...)                     │
-     │                                                          │
-     │ ended 検知時:                                            │
-     │ chrome.runtime.sendMessage  → service worker へ          │
-     │                                                          │
+[本体フロント]                                       [本体バックエンド]
+     │ POST /api/extension/play  { itemId, sourceUrl }      │
+     ├─────────────────────────────────────────────────────►│
+     │                                                       │
+     │ ◄── chrome.runtime.sendMessage（externally_connectable）
+     │                                                       │
+[Chrome 拡張 service worker]                                  │
+     │ chrome.tabs.create or chrome.tabs.update              │
+     │   ({ url: sourceUrl })                                │
+     │                                                       │
+[コンテンツスクリプト（対象ドメインで動く）]                  │
+     │ document.querySelector('video') を監視                │
+     │ video.addEventListener('ended', ...)                  │
+     │                                                       │
+     │ ended 検知時:                                         │
+     │ chrome.runtime.sendMessage  → service worker へ       │
+     │                                                       │
      │ service worker: fetch('http://nagara.local/api/extension/event'
-     │                       , { method:'POST', body:{ type:'ended', itemId } })
-     ├─────────────────────────────────────────────────────────►│
-     │                                                          │
-     │ ◄─ SSE で本体フロントへ ended イベントを push ───────────│
-     │                                                          │
-     │ ExtensionTabAdapter.on(handler) が ended を発火          │
-     │ → 上位レイヤがキュー次に進める                             │
+     │                       , { body:{ kind:'ended', itemId } })
+     ├─────────────────────────────────────────────────────►│
+     │                                                       │
+     │ ◄─── WebSocket で extension_event を本体フロントへ ───│
+     │                                                       │
+     │ ExtensionTabAdapter.on() が ended を発火              │
+     │ → POST /api/queue/complete                            │
 ```
 
-**設計上の重要ポイント:**
+重要ポイント:
 
-- 拡張は **「ユーザ自身が普通にブラウザを使うのを自動化する」** だけ。DRM 解除・ストリーム保存はしない。
-- `chrome.tabs.create` の戻り値の `tab.id` を保持しておき、次のエピソードに移るときは
-  **同じタブの URL を `chrome.tabs.update(tabId, { url })` で差し替える**ことでタブの増殖を避ける。
-  これによりブラウザ全体の負荷も抑えられ、autoplay の文脈も維持しやすい
-  （[02-research.md](./02-research.md) §2-4 の autoplay 制約への対策）。
-- 本体は拡張がインストールされていない／応答しないときに `extension_missing` イベントを上に流し、
-  ユーザに **拡張インストールを促すバナー** を表示する。インストール後はこのアイテムから再開できる。
+- 拡張は **ユーザ自身がブラウザで普通に閲覧するのを自動化する** だけ。
+  DRM 解除・ストリーム保存はしない。表示は当該サイトの公式プレイヤーが行う。
+- `chrome.tabs.create` の戻り値 `tab.id` を保持し、次の Tier 3 アイテムでは
+  **同じタブの URL を `chrome.tabs.update(tabId, { url })` で差し替える**
+  （タブ増殖防止・autoplay 文脈の維持）。
+- 拡張未インストール時は、Tier 3 アイテム再生開始時にインストール案内バナーを出す。
 
-### 7-2d. Tier 2 の m3u8 短期失効への対処
+### 7-5. 自動再生制御
 
-`HlsVideoAdapter.load()` 時、`item.resolved_at` をサーバから受け取ってフロントで判定する:
+- 初回起動時はプレイヤー領域に **「再生を開始」ボタン**。クリックで `play()`。
+- 連鎖再生は同一ジェスチャ文脈で動くので追加対応不要。
+- `play()` が `NotAllowedError` で reject されたら「Resume」ボタンを再表示する。
+- `<iframe>` 親要素には `allow="autoplay"` を付ける。
+
+### 7-6. Tier 2 の m3u8 短期失効への対処
+
+`HlsVideoAdapter.load()` 時、`item.resolved_at` をサーバから受け取ってフロントで判定:
 
 ```ts
 const RESOLUTION_TTL = 30 * 60 * 1000; // 30 分（保守的に短め）
 if (Date.now() - new Date(item.resolved_at).getTime() > RESOLUTION_TTL) {
   await fetch(`/api/items/${item.id}/resolve`, { method: 'POST' });
-  // 再取得した item を使い直す
+  // WebSocket の item_meta_updated を待って最新 item を使う
 }
 ```
 
-- TTL は設定可能。サイトごとの実態に応じて伸縮する余地を残す（`settings.ytdlp_resolution_ttl_seconds`）。
-- 解決失敗（DRM 等）が後から発覚したら、サーバ側で `source_kind` を `extension_tab` に降格させる
-  → 次回の `play()` 時に `ExtensionTabAdapter` が選ばれる。
-
-### 7-3. 自動再生の制御
-
-- 初回起動時はプレイヤー領域に **「再生を開始」ボタン**。クリックで `play()`。
-- 連鎖再生は同一ジェスチャ文脈内で動くので追加対応不要。
-- `play()` が `NotAllowedError` で reject されたら「Resume」ボタンを再表示する。
-
-### 7-4. ザッピング機能
-
-- 設定 `zapping_timeout_seconds`（デフォルト `0` = 無効）。
-- 0 でない場合、エピソード再生開始から該当秒数経過時にオーバーレイ:
-
-  ```
-  ┌────────────────────────────┐
-  │ そろそろ次に行きます       │
-  │ 8 秒後に切り替え            │
-  │ [このまま続ける] [いま切替] │
-  └────────────────────────────┘
-  ```
-
-- 猶予秒数 `zapping_grace_seconds`（デフォルト 10）が経つか「いま切替」で
-  `POST /api/queue/complete { status: 'skipped', progressSeconds }` を発行して次へ。
-- 「このまま続ける」でタイマーリセット。
-- `ended` 由来の遷移時はオーバーレイなしで即次へ（自然に終わったケース）。
-
-**MVP のデフォルトを 0（無効）にする理由:**
-- タスクフィードバック「自分で積んだものを強制スキップしたくない」を尊重。
-- ユーザが運用してみて「やっぱりタイマー欲しい」となったら設定で有効化する。
-
-### 7-5. URL 投入 → 再生までのフロント側フロー
-
-```
-URLを貼る → POST /api/queue { url }
-            └→ items + queue_items 作成、メタ取得は非同期
-キュー再取得 → 末尾に新しい行が追加される（title が空でも先に position は確定）
-ポーリング or SWR で
-items.meta_status='ok' を検知 → 該当行のタイトル等を更新表示
-```
-
-メタ取得が失敗しても `source_url` は分かるので、行は表示し続ける（タイトル欄が空 or "（メタ取得失敗）"）。
+TTL は設定可能（`settings.ytdlp_resolution_ttl_seconds`）。
+解決失敗（DRM 等）が後から発覚したら、サーバ側で `source_kind` を `extension_tab` に降格させる。
 
 ## 8. ディレクトリ構成（実装着手時の想定）
 
 ```
 nagara/                # ← 設計ドキュメント（このフォルダ）
-nagara-app/            # ← 実装が始まったらここに置く想定（モノレポ形式）
-├ package.json
-├ src/
-│  ├ server/
-│  │  ├ index.ts
-│  │  ├ db.ts
-│  │  ├ schema.sql
-│  │  ├ meta/                  # メタ取得（oEmbed / og:tags / RSS）
-│  │  │  ├ youtube-oembed.ts
-│  │  │  ├ og-tags.ts
-│  │  │  └ audio-head.ts
-│  │  ├ ytdlp/                 # Tier 2（yt-dlp 子プロセス、formats 解析）
-│  │  │  ├ resolve.ts
-│  │  │  └ classify.ts         # DRM/HLS/progressive 判定
-│  │  ├ stream-proxy.ts        # Tier 2（HLS マニフェスト書換 + セグメント中継）
-│  │  ├ extension-bridge.ts    # Tier 3（SSE エンドポイントと event 受け口）
-│  │  └ routes/
-│  │     ├ items.ts
-│  │     ├ queue.ts
-│  │     ├ history.ts
-│  │     ├ settings.ts
-│  │     ├ stream.ts
-│  │     └ extension.ts
-│  ├ web/
-│  │  ├ index.html
+nagara-app/            # ← 実装本体（モノレポ）
+├ go.mod
+├ go.sum
+├ cmd/
+│  └ nagara/
+│     └ main.go               # エントリポイント
+├ internal/
+│  ├ server/                  # HTTP / WebSocket / 静的配信
+│  │  ├ router.go
+│  │  ├ hub.go                # WebSocket Hub
+│  │  ├ static.go             # embed.FS の配信
+│  │  └ handlers/
+│  │     ├ items.go
+│  │     ├ queue.go
+│  │     ├ history.go
+│  │     ├ settings.go
+│  │     ├ stream.go          # HLS プロキシ
+│  │     ├ extension.go
+│  │     └ ws.go              # /api/ws
+│  ├ store/                   # SQLite アクセス
+│  │  ├ db.go
+│  │  ├ schema.sql            // go:embed
+│  │  ├ items.go
+│  │  ├ queue.go
+│  │  └ history.go
+│  ├ meta/                    # メタ取得
+│  │  ├ youtube_oembed.go
+│  │  ├ og_tags.go
+│  │  └ audio_head.go
+│  ├ ytdlp/                   # Tier 2 解決
+│  │  ├ resolve.go
+│  │  └ classify.go           # DRM/HLS/progressive 判定
+│  └ events/                  # イベント定義
+│     └ events.go
+├ web/                        # フロント（Vite + React + TS）
+│  ├ index.html
+│  ├ src/
 │  │  ├ main.tsx
 │  │  ├ player/
 │  │  │  ├ PlayerAdapter.ts
 │  │  │  ├ YouTubeEmbedAdapter.ts
 │  │  │  ├ AudioFileAdapter.ts
-│  │  │  ├ HlsVideoAdapter.ts          # Tier 2
-│  │  │  └ ExtensionTabAdapter.ts      # Tier 3
+│  │  │  ├ HlsVideoAdapter.ts
+│  │  │  └ ExtensionTabAdapter.ts
 │  │  ├ pages/
 │  │  │  ├ Player.tsx
+│  │  │  ├ Quick.tsx
 │  │  │  ├ History.tsx
 │  │  │  └ Settings.tsx
+│  │  ├ ws/
+│  │  │  └ NagaraSocket.ts    # WS 接続・購読
 │  │  └ components/...
-│  └ extension/                # Chrome 拡張（MV3）
-│     ├ manifest.json
-│     ├ service-worker.ts
-│     └ content/
-│        └ video-watcher.ts
-├ data/                # SQLite ファイル（gitignore）
+│  └ public/
+│     └ manifest.webmanifest  # PWA 化（補助 UI 用）
+├ extension/                  # Chrome 拡張（MV3）
+│  ├ manifest.json
+│  ├ service-worker.ts
+│  └ content/
+│     └ video-watcher.ts
+├ data/                       # SQLite ファイル（gitignore）
 └ scripts/
    ├ install-systemd.sh
-   └ install-ytdlp.sh   # yt-dlp バイナリのインストール
+   └ install-ytdlp.sh
 ```
+
+ビルド:
+
+- `pnpm --filter web build` で `web/dist/` を生成。
+- Go から `//go:embed all:web/dist` で同梱。
+- `go build -o nagara ./cmd/nagara` で完成。
 
 ## 9. 受け入れ条件（DoD）
 
-依頼方針「ミニマムに作って触ってから設計を詰める」と
-「ながら聞きコンセプトを破綻させない」を満たすため、初回リリースの DoD:
+初回リリースの DoD:
+
+**コア体験**
+- [ ] メイン UI と補助 UI（`/quick`）の両方から URL を貼って末尾追加できる。
+- [ ] 補助 UI で追加した瞬間に、メイン UI のキュー末尾に行が現れる（WebSocket 反映）。
+- [ ] メタ取得が完了するとタイトル等がメイン UI に自動で反映される。
+- [ ] 「今すぐ割り込みで見る」を実行すると、現再生中の再生位置が保存される。
+- [ ] 割り込みアイテムが終了すると、元のアイテムが保存位置から自動復帰する。
+- [ ] 多段の割り込み（割り込み中に更に割り込み）でもスタックが正しく復帰する。
+- [ ] キューはドラッグで並び替えできる。削除も「次に再生」も動く。
+- [ ] ブラウザ再起動してもキュー・割り込みスタックが復元される（SQLite 永続化）。
+- [ ] 履歴画面で過去のアイテムを再投入できる。
 
 **Tier 1（ネイティブ埋め込み）**
 - [ ] YouTube 動画 URL を貼ると、oEmbed でメタが埋まり、IFrame Player API で再生される。
 - [ ] mp3 直リンを貼ると、メタが推定で埋まり、`<audio>` で再生される。
-- [ ] エピソード末尾まで来たら自動で次に進む（人間操作なしで連続再生）。
+- [ ] エピソード末尾で自動で次に進む（人間操作なしで連続再生）。
 
 **Tier 2（yt-dlp + hls.js）**
 - [ ] yt-dlp 対応サイトの DRM 無し動画 URL を貼ると、バックエンドで m3u8 が解決される。
@@ -538,19 +605,10 @@ nagara-app/            # ← 実装が始まったらここに置く想定（モ
 - [ ] nagara 専用 Chrome 拡張（MV3）を開発者モードで読み込める。
 - [ ] TVer の URL を貼ると拡張が新しいタブを開いて公式プレイヤーで再生する。
 - [ ] そのタブで動画が `ended` した瞬間に拡張がイベントを本体に送り、本体が次のエピソードへ進める。
-- [ ] 次のエピソードが Tier 3 のときは、同じタブの URL を更新して使い回す（タブ増殖を防ぐ）。
+- [ ] 次のエピソードが Tier 3 のときは、同じタブの URL を更新して使い回す。
 - [ ] 拡張未インストール時は、Tier 3 アイテム再生開始時にインストール案内バナーが出る。
 
-**コア体験（Tier 横断）**
-- [ ] キューはドラッグで並び替えできる。削除も「次これ再生」も動く。
-- [ ] ブラウザ再起動してもキューが復元される（SQLite 永続化）。
-- [ ] 履歴画面で過去のアイテムを再投入できる。
-- [ ] ザッピングタイマーは設定で有効化したときのみ動作する。
-
 **運用**
-- [ ] Linux PC で `node dist/server.js` を systemd に登録するだけで常駐できる。
+- [ ] Linux PC で `go build` した単一バイナリを systemd で起動するだけで使い始められる。
 - [ ] yt-dlp バイナリは `scripts/install-ytdlp.sh` で取得・更新できる。
-
-ここまで満たせば「触ってみる」が成立する。
-そこから運用してみて、自動キューイングや投稿者管理の必要性を見極めて
-[04-roadmap.md](./04-roadmap.md) のロードマップに沿って積み増す。
+- [ ] 補助 UI は PWA 対応で、スマホのホーム画面に追加できる。
